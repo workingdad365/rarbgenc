@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, Qt, QThread, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont, QPixmap
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -41,6 +41,8 @@ VIDEO_FILTER = (
 LOG_TAIL_LINES = 200
 LOGO_PATH = Path(__file__).parent / "assets" / "rarbg_logo.png"
 LOGO_HEIGHT = 36
+ICON_PATH = Path(__file__).parent / "assets" / "icon.png"
+APP_ID = "drasys.rarbgenc"
 
 
 def _elastic(label: QLabel) -> QLabel:
@@ -52,6 +54,19 @@ def _elastic(label: QLabel) -> QLabel:
 def _format_seconds(seconds: float) -> str:
     total = int(max(seconds, 0))
     return f"{total // 3600:d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _set_windows_app_id(app_id: str) -> None:
+    """Windows 작업 표시줄이 python 대신 이 앱의 아이콘을 쓰도록 AppUserModelID 를 지정함"""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except (AttributeError, OSError):
+        pass
+
 
 
 class DropArea(QFrame):
@@ -243,6 +258,7 @@ class MainWindow(QMainWindow):
         self._started_at = 0.0
 
         self.setWindowTitle(f"rarbgenc {__version__} - RARBG-style x264 encoder")
+        self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(760, 720)
         self._build_ui()
         self._load_settings()
@@ -682,8 +698,10 @@ class MainWindow(QMainWindow):
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
+    _set_windows_app_id(APP_ID)
     app = QApplication(argv)
     app.setApplicationName("rarbgenc")
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
     initial = argv[1] if len(argv) > 1 else None
     window = MainWindow(Settings.load(), initial)
     window.show()

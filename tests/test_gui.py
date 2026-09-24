@@ -141,4 +141,6 @@ def test_header_shows_logo_and_version(qapp, no_dialogs):
     assert window.logo_label.pixmap().height() == gui.LOGO_HEIGHT
     assert __version__ == "1.0.0"
     assert "1.0.0" in window.windowTitle()
+    assert gui.ICON_PATH.exists()
+    assert not window.windowIcon().isNull()
     window.close()
