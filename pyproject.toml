@@ -1,6 +1,6 @@
 [project]
 name = "rarbgenc"
-version = "1.0.0"
+version = "1.1.0"
 description = "Desktop encoder for x264/x265 MP4 files using RARBG sample-based 2-pass profiles"
 readme = "README.md"
 authors = [

@@ -1,6 +1,6 @@
 """rarbg 와 동일한 설정으로 x264 mp4 를 만드는 데스크톱 인코더."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def main() -> int:
