@@ -50,6 +50,7 @@ class Settings:
     description_history: list[str] = field(default_factory=lambda: [DEFAULT_DESCRIPTION])
     fallback_language: str = DEFAULT_LANGUAGE  # 원본에 언어 정보가 없을 때 사용
     last_open_dir: str = ""
+    video_codec: str = "x264"
 
     def remember_description(self, text: str) -> None:
         """현재 디스크립션을 기록하고 이력 맨 앞에 추가함"""
@@ -81,6 +82,8 @@ class Settings:
         values["description_history"] = [
             h for h in values["description_history"] if isinstance(h, str)
         ][:HISTORY_LIMIT]
+        if values["video_codec"] not in ("x264", "x265"):
+            values["video_codec"] = defaults.video_codec
         return cls(**values)
 
     def save(self, path: Path | None = None) -> None:

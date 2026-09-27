@@ -257,11 +257,12 @@ class MainWindow(QMainWindow):
         self.downloader: DownloadWorker | None = None
         self._started_at = 0.0
 
-        self.setWindowTitle(f"rarbgenc {__version__} - RARBG-style x264 encoder")
+        self.setWindowTitle(f"rarbgenc {__version__} - RARBG-style x264/x265 encoder")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(760, 720)
         self._build_ui()
         self._load_settings()
+        self.codec_combo.currentIndexChanged.connect(self.check_ffmpeg)
         self.check_ffmpeg()
         if initial_file:
             self.load_file(initial_file)
@@ -282,7 +283,7 @@ class MainWindow(QMainWindow):
             self.logo_label.setPixmap(
                 logo.scaledToHeight(LOGO_HEIGHT, Qt.TransformationMode.SmoothTransformation)
             )
-        title = QLabel(f"<b>x264 2-pass encoder</b><br>v{__version__}", self)
+        title = QLabel(f"<b>x264 / x265 2-pass encoder</b><br>v{__version__}", self)
         header.addWidget(self.logo_label)
         header.addSpacing(8)
         header.addWidget(title)
@@ -349,6 +350,9 @@ class MainWindow(QMainWindow):
         # 출력
         output_box = QGroupBox("Output", self)
         output_form = QFormLayout(output_box)
+        self.codec_combo = QComboBox(output_box)
+        self.codec_combo.addItem("H.264 / x264 - 8-bit, 2500 kbps", "x264")
+        self.codec_combo.addItem("H.265 / x265 - 10-bit, 2000 kbps", "x265")
         self.description_combo = QComboBox(output_box)
         self.description_combo.setEditable(True)
         self.description_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -367,6 +371,7 @@ class MainWindow(QMainWindow):
         self.output_preview.setWordWrap(True)
         _elastic(self.output_preview)
         self.output_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        output_form.addRow("Video:", self.codec_combo)
         output_form.addRow("Description:", self.description_combo)
         output_form.addRow("Directory:", dir_row)
         output_form.addRow("Suffix:", self.suffix_edit)
@@ -408,12 +413,14 @@ class MainWindow(QMainWindow):
         self.description_combo.setEditText(s.description)
         self.output_dir_edit.setText(s.output_dir)
         self.suffix_edit.setText(s.suffix)
+        self.codec_combo.setCurrentIndex(max(0, self.codec_combo.findData(s.video_codec)))
 
     def _store_settings(self) -> None:
         s = self.settings
         s.remember_description(self.description_combo.currentText())
         s.output_dir = self.output_dir_edit.text().strip()
         s.suffix = self.suffix_edit.text()
+        s.video_codec = self.codec_combo.currentData()
         try:
             s.save()
         except OSError as exc:
@@ -423,6 +430,10 @@ class MainWindow(QMainWindow):
 
     def check_ffmpeg(self) -> None:
         self.ffmpeg = ffmpeg_tools.locate()
+        self._check_selected_encoder()
+
+    def _check_selected_encoder(self) -> None:
+        codec = f"lib{self.codec_combo.currentData()}"
         if self.ffmpeg is None:
             self._show_banner(
                 "ffmpeg was not found.\n\n" + ffmpeg_tools.install_hint()
@@ -430,14 +441,14 @@ class MainWindow(QMainWindow):
                 "for rarbgenc only."
             )
             self.statusBar().showMessage("ffmpeg not found")
-        elif not ffmpeg_tools.has_encoder(self.ffmpeg.ffmpeg, "libx264"):
+        elif not ffmpeg_tools.has_encoder(self.ffmpeg.ffmpeg, codec):
             self._show_banner(
-                f"The ffmpeg at {self.ffmpeg.ffmpeg} was built without libx264.\n\n"
+            f"The ffmpeg at {self.ffmpeg.ffmpeg} was built without {codec}.\n\n"
                 + ffmpeg_tools.install_hint()
                 + "\n\nOr click the button below to download a static ffmpeg build "
-                "that includes libx264."
+                f"that includes {codec}."
             )
-            self.statusBar().showMessage(f"ffmpeg without libx264: {self.ffmpeg.ffmpeg}")
+            self.statusBar().showMessage(f"ffmpeg without {codec}: {self.ffmpeg.ffmpeg}")
             self.ffmpeg = None
         else:
             self.banner.hide()
@@ -468,11 +479,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Download failed", f"Could not download ffmpeg:\n{error}")
             return
         self.ffmpeg = paths
-        self.banner.hide()
-        self.statusBar().showMessage(
-            f"{ffmpeg_tools.version(paths.ffmpeg)}  (bundled: {paths.ffmpeg})"
-        )
-        self._update_start_enabled()
+        self._check_selected_encoder()
         if self.media is None and self.drop_area.property("pending"):
             self.load_file(self.drop_area.property("pending"))
 
@@ -584,7 +591,7 @@ class MainWindow(QMainWindow):
     def _set_inputs_enabled(self, enabled: bool) -> None:
         for widget in (
             self.drop_area, self.open_button, self.description_combo,
-            self.output_dir_edit, self.suffix_edit,
+            self.output_dir_edit, self.suffix_edit, self.codec_combo,
         ):
             widget.setEnabled(enabled)
         if enabled:
@@ -636,6 +643,7 @@ class MainWindow(QMainWindow):
             audio_channels=track.channels if track else 0,
             language=language,
             description=description,
+            video_codec=self.codec_combo.currentData(),
         )
         self.log_view.clear()
         self.runner = EncodeRunner(self.ffmpeg.ffmpeg, job, self.media.duration)

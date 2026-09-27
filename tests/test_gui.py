@@ -74,9 +74,13 @@ def test_window_language_behaviour(qapp, no_dialogs, ffmpeg_paths, sample_dir):
     window.close()
 
 
+@pytest.mark.parametrize("video_codec", ["x264", "x265"])
 def test_window_encodes_and_saves_settings(qapp, no_dialogs, ffmpeg_paths, sample_dir, tmp_path,
-                                           isolated_settings):
+                                           isolated_settings, video_codec):
+    if not gui.ffmpeg_tools.has_encoder(ffmpeg_paths.ffmpeg, f"lib{video_codec}"):
+        pytest.skip(f"ffmpeg with lib{video_codec} is not available")
     window = gui.MainWindow(Settings(), str(sample_dir / "multi.mkv"))
+    window.codec_combo.setCurrentIndex(window.codec_combo.findData(video_codec))
     window.track_combo.setCurrentIndex(0)
     window.language_combo.setEditText("fre")
     window.description_combo.setEditText("My test rip")
@@ -85,6 +89,8 @@ def test_window_encodes_and_saves_settings(qapp, no_dialogs, ffmpeg_paths, sampl
 
     window.start_encoding()
     assert window.runner is not None
+    assert window.runner._job.video_codec == video_codec
+    assert not window.codec_combo.isEnabled()
     assert not window.start_button.isEnabled()
     _wait_finished(window)
 
@@ -92,13 +98,18 @@ def test_window_encodes_and_saves_settings(qapp, no_dialogs, ffmpeg_paths, sampl
     assert out.exists()
     assert window.progress_bar.value() == 1000
     assert no_dialogs[-1][0] == "information"
+    assert window.codec_combo.isEnabled()
 
     saved = Settings.load(isolated_settings)
     assert saved.fallback_language == "fre"
     assert saved.description == "My test rip"
     assert saved.description_history[0] == "My test rip"
     assert saved.output_dir == str(out_dir)
+    assert saved.video_codec == video_codec
     window.close()
+    restored = gui.MainWindow(saved)
+    assert restored.codec_combo.currentData() == video_codec
+    restored.close()
 
 
 def test_invalid_language_is_rejected(qapp, no_dialogs, ffmpeg_paths, sample_dir):
@@ -111,8 +122,12 @@ def test_invalid_language_is_rejected(qapp, no_dialogs, ffmpeg_paths, sample_dir
     window.close()
 
 
-def test_cancel_removes_partial_output(qapp, no_dialogs, ffmpeg_paths, sample_dir, tmp_path):
-    window = gui.MainWindow(Settings(), str(sample_dir / "multi.mkv"))
+@pytest.mark.parametrize("video_codec", ["x264", "x265"])
+def test_cancel_removes_partial_output(qapp, no_dialogs, ffmpeg_paths, sample_dir, tmp_path,
+                                      video_codec):
+    if not gui.ffmpeg_tools.has_encoder(ffmpeg_paths.ffmpeg, f"lib{video_codec}"):
+        pytest.skip(f"ffmpeg with lib{video_codec} is not available")
+    window = gui.MainWindow(Settings(video_codec=video_codec), str(sample_dir / "multi.mkv"))
     window.output_dir_edit.setText(str(tmp_path))
     window.start_encoding()
     window.cancel_encoding()
@@ -129,6 +144,22 @@ def test_missing_ffmpeg_shows_banner(qapp, no_dialogs, monkeypatch):
     assert not window.banner.isHidden()
     assert "ffmpeg was not found" in window.banner_label.text()
     assert not window.start_button.isEnabled()
+    window.close()
+
+
+def test_missing_selected_encoder(qapp, no_dialogs, monkeypatch, ffmpeg_paths, sample_dir):
+    monkeypatch.setattr(gui.ffmpeg_tools, "locate", lambda: ffmpeg_paths)
+    monkeypatch.setattr(gui.ffmpeg_tools, "has_encoder", lambda _path, codec: codec == "libx264")
+    window = gui.MainWindow(Settings(), str(sample_dir / "multi.mkv"))
+    assert window.start_button.isEnabled()
+    window.codec_combo.setCurrentIndex(window.codec_combo.findData("x265"))
+    assert "without libx265" in window.banner_label.text()
+    assert not window.start_button.isEnabled()
+    window._on_download_done(ffmpeg_paths, "")
+    assert not window.start_button.isEnabled()
+    window.codec_combo.setCurrentIndex(window.codec_combo.findData("x264"))
+    assert window.start_button.isEnabled()
+    assert window.banner.isHidden()
     window.close()
 
 

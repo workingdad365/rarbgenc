@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from rarbgenc.settings import DEFAULT_DESCRIPTION, HISTORY_LIMIT, Settings
 
 
@@ -9,11 +11,12 @@ def test_defaults_when_missing(tmp_path):
     assert s.suffix == "_ENCODED"
     assert s.fallback_language == "eng"
     assert s.description == DEFAULT_DESCRIPTION
+    assert s.video_codec == "x264"
 
 
 def test_roundtrip(tmp_path):
     path = tmp_path / "sub" / "settings.json"
-    s = Settings(output_dir="D:/out", suffix="_x264", fallback_language="kor")
+    s = Settings(output_dir="D:/out", suffix="_x265", fallback_language="kor", video_codec="x265")
     s.remember_description("My rip")
     s.save(path)
     loaded = Settings.load(path)
@@ -45,6 +48,13 @@ def test_wrong_types_fall_back_per_field(tmp_path):
     assert s.suffix == "_ENCODED"
     assert s.output_dir == "X"
     assert s.description_history == ["a", "b"]
+
+
+@pytest.mark.parametrize("codec", ["invalid", "", None, 265])
+def test_invalid_video_codec_falls_back(tmp_path, codec):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"video_codec": codec}), encoding="utf-8")
+    assert Settings.load(path).video_codec == "x264"
 
 
 def test_description_history():

@@ -1,7 +1,7 @@
 [project]
 name = "rarbgenc"
 version = "1.0.0"
-description = "Desktop encoder that produces x264 MP4 files with the same 2-pass settings RARBG used"
+description = "Desktop encoder for x264/x265 MP4 files using RARBG sample-based 2-pass profiles"
 readme = "README.md"
 authors = [
     { name = "workingdad365", email = "workingdad365@gmail.com" }

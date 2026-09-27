@@ -64,12 +64,16 @@ def test_pass2_matches_rarbg():
     assert _value(cmd, "-x264-params") == (
         "me=umh:subme=9:me_range=24:ref=4:trellis=2:lookahead_threads=4:direct=auto"
         ":keyint_min=25:vbv_maxrate=31250:vbv_bufsize=31250:filler=0:psy_rd=1.00,0.15"
-        ":aq-mode=3:deblock=-1,-1:chroma_qp_offset=0"
+        ":aq-mode=3:deblock=-1,-1:chroma_qp_offset=0:b-adapt=2:rc-lookahead=50"
     )
     assert _metadata(cmd, "-map") == ["0:V:0", "0:2"]
     assert _value(cmd, "-c:a") == "aac"
     assert _value(cmd, "-b:a") == "224k"
     assert _value(cmd, "-ac") == "6"
+    assert _value(cmd, "-ar") == "48000"
+    assert _value(cmd, "-pix_fmt") == "yuv420p"
+    assert _value(cmd, "-profile:v") == "high"
+    assert _value(cmd, "-level:v") == "4.1"
     assert _metadata(cmd) == [
         "creation_time=now",
         "title=Movie.2010.1080p",
@@ -95,6 +99,28 @@ def test_pass2_without_audio():
     assert "-c:a" not in cmd
     assert "-metadata:s:a:0" not in cmd
     assert _metadata(cmd, "-map") == ["0:V:0"]
+
+
+@pytest.mark.parametrize("pass_no", [1, 2])
+def test_x265_options(pass_no):
+    build = encoder.build_pass1 if pass_no == 1 else encoder.build_pass2
+    cmd = build("ffmpeg", _job(video_codec="x265"), Path("C:/temp dir/passlog"))
+    assert _value(cmd, "-c:v") == "libx265"
+    assert _value(cmd, "-pix_fmt") == "yuv420p10le"
+    assert _value(cmd, "-profile:v") == "main10"
+    assert _value(cmd, "-b:v") == "2000k"
+    assert _value(cmd, "-preset") == "slow"
+    params = _value(cmd, "-x265-params")
+    assert f":pass={pass_no}:stats=C\\:/temp dir/passlog" in params
+    assert ":aq-mode=3:" in params
+    assert ":sao=0:" in params
+    assert "-x264-params" not in cmd
+    assert "-pass" not in cmd
+
+
+def test_invalid_video_codec():
+    with pytest.raises(ValueError, match="Unsupported video codec"):
+        _job(video_codec="invalid")
 
 
 def test_pass2_description_with_special_characters():
