@@ -527,6 +527,8 @@ class MainWindow(QMainWindow):
         self.track_combo.blockSignals(False)
         self._update_audio_ui()
         self._update_output_preview()
+        if not media.is_1080p:
+            self._show_resolution_warning()
 
     # ---- 오디오 ----
 
@@ -584,9 +586,24 @@ class MainWindow(QMainWindow):
     def _update_start_enabled(self) -> None:
         self.start_button.setEnabled(
             self.runner is None and self.ffmpeg is not None and self.media is not None
+            and self.media.is_1080p
         )
 
     # ---- 인코딩 ----
+
+    def _show_resolution_warning(self) -> None:
+        assert self.media is not None
+        resolution = f"{self.media.width or '?'}x{self.media.height or '?'}"
+        self.status_label.setText(f"Unsupported source resolution: {resolution}")
+        QMessageBox.warning(
+            self, "1080p source required",
+            f"{self.media.path.name}\nSource resolution: {resolution}\n\n"
+            "These encoding profiles support only 1080p sources.\n"
+            "1920x1080 and cropped 1080p (e.g. 1920x804 or 1920x1040) are supported.\n"
+            "Dimensions must be positive even numbers, no larger than 1920x1080, "
+            "with width 1920 or height 1080.\n"
+            "Choose a supported source; automatic resizing is not performed.",
+        )
 
     def _set_inputs_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -602,6 +619,9 @@ class MainWindow(QMainWindow):
 
     def start_encoding(self) -> None:
         if self.media is None or self.ffmpeg is None or self.runner is not None:
+            return
+        if not self.media.is_1080p:
+            self._show_resolution_warning()
             return
         out = self._output_path()
         assert out is not None

@@ -26,12 +26,13 @@ def ffmpeg_paths():
     return paths
 
 
-def _make_sample(ffmpeg: str, out: Path, audio_specs: list[tuple[str, str | None]]) -> Path:
-    """lavfi 로 3초짜리 샘플 생성. audio_specs: (channel_layout, language 또는 None)"""
+def _make_sample(ffmpeg: str, out: Path, audio_specs: list[tuple[str, str | None]],
+           size: str = "320x240", duration: float = 3) -> Path:
+    """lavfi 샘플 생성. audio_specs: (channel_layout, language 또는 None)"""
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-           "-f", "lavfi", "-i", "testsrc=size=320x240:rate=24:duration=3"]
+        "-f", "lavfi", "-i", f"testsrc=size={size}:rate=24:duration={duration}"]
     for layout, _lang in audio_specs:
-        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration=3,aformat=channel_layouts={layout}"]
+     cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={duration},aformat=channel_layouts={layout}"]
     cmd += ["-map", "0:v"]
     for i in range(len(audio_specs)):
         cmd += ["-map", f"{i + 1}:a"]
@@ -52,4 +53,14 @@ def sample_dir(tmp_path_factory, ffmpeg_paths) -> Path:
     _make_sample(ff, directory / "multi.mkv", [("5.1", None), ("stereo", "kor")])
     _make_sample(ff, directory / "mono.mkv", [("mono", "jpn")])
     _make_sample(ff, directory / "silent.mkv", [])
+    return directory
+
+
+@pytest.fixture(scope="session")
+def hd_sample_dir(tmp_path_factory, ffmpeg_paths) -> Path:
+    directory = tmp_path_factory.mktemp("hd_samples")
+    _make_sample(
+        ffmpeg_paths.ffmpeg, directory / "multi.mkv", [("5.1", None), ("stereo", "kor")],
+        size="1920x1080", duration=1,
+    )
     return directory

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from rarbgenc.probe import parse_probe
 
 SAMPLE = {
@@ -51,4 +53,23 @@ def test_parse_probe_fallbacks():
 def test_parse_probe_no_video():
     info = parse_probe(Path("x.mka"), {"streams": [{"index": 0, "codec_type": "audio"}]})
     assert not info.has_video
+    assert not info.is_1080p
     assert info.duration is None
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "supported"),
+    [
+        (1920, 1080, True), (1920, 804, True), (1920, 1040, True),
+        (1440, 1080, True), (1280, 720, False), (3840, 2160, False),
+        (2048, 1080, False), (1920, 1200, False), (1080, 1920, False),
+        (1280, 800, False), (1920, 803, False), (None, 1080, False),
+        (1920, None, False), (1920, 0, False), (0, 1080, False),
+        ("1920", 1080, False),
+    ],
+)
+def test_1080p_resolution_policy(width, height, supported):
+    info = parse_probe(Path("x.mkv"), {"streams": [
+        {"codec_type": "video", "codec_name": "h264", "width": width, "height": height},
+    ]})
+    assert info.is_1080p is supported

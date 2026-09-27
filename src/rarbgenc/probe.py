@@ -52,6 +52,17 @@ class MediaInfo:
     def has_video(self) -> bool:
         return self.video_codec is not None
 
+    @property
+    def is_1080p(self) -> bool:
+        width, height = self.width, self.height
+        if not self.has_video or not isinstance(width, int) or not isinstance(height, int):
+            return False
+        return (
+            0 < width <= 1920 and 0 < height <= 1080
+            and width % 2 == 0 and height % 2 == 0
+            and (width == 1920 or height == 1080)
+        )
+
     def summary(self) -> str:
         parts = []
         if self.video_codec:

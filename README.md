@@ -4,7 +4,7 @@
 
 **English** | [한국어](README.ko.md)
 
-A small desktop app (PySide6) that encodes videos into H.264 or H.265 MP4 files using
+A small desktop app (PySide6) that encodes only 1080p source videos into H.264 or H.265 MP4 files using
 2-pass profiles reconstructed from RARBG Blu-ray samples.
 
 ![](screenshot.webp)
@@ -14,6 +14,7 @@ A small desktop app (PySide6) that encodes videos into H.264 or H.265 MP4 files 
 ## Features
 
 - Open a source video with a file dialog or drag & drop
+- Only 1080p sources are accepted; unsupported resolutions trigger a warning and cannot be encoded
 - Choose H.264 / x264 (8-bit, 2500 kbps, default) or H.265 / x265 (10-bit, 2000 kbps)
 - Pick the audio track to encode (all tracks are listed via `ffprobe`)
 - The audio language tag is copied from the source track. Only when the source has
@@ -44,6 +45,21 @@ Only the first video stream and the selected audio track are written; subtitles 
 Pass log files go to a temporary folder and are deleted after encoding.
 Resolution and frame rate follow the source; these profiles target SDR Blu-ray material,
 not HDR tone mapping or automatic 1080p resizing.
+
+### Supported source resolutions
+
+Both x264 and x265 profiles are restricted to 1080p sources. The app checks the first
+non-cover-art video stream reported by `ffprobe`:
+
+- Full HD: `1920x1080`.
+- Cropped 1080p: positive, even dimensions no larger than `1920x1080`, with either
+  width `1920` or height `1080`. This includes `1920x804`, `1920x1040`, and `1440x1080`.
+- Other sizes (including 720p and 4K), unknown dimensions, and odd dimensions are rejected.
+
+Opening an unsupported source shows a warning with its resolution and disables
+**Start encoding**. The resolution is also checked before encoding starts. Selecting
+a supported source enables encoding again. No automatic scaling is performed.
+This is a dimension-based check; it cannot establish a file's original resolution before cropping or upscaling.
 
 ### Sample verification
 
@@ -114,7 +130,7 @@ rarbgenc                 # open the window
 rarbgenc "movie.mkv"     # open the window with a file preloaded
 ```
 
-1. Drop a video on the window (or click **Open...**).
+1. Drop a supported 1080p video on the window (or click **Open...**).
 2. Choose the audio track. Set the language only if the source track has none.
 3. Select **Output > Video**, then edit the description, output directory and suffix if needed.
 4. Click **Start encoding**.
