@@ -58,9 +58,9 @@ non-cover-art video stream reported by `ffprobe`:
   width `1920` or height `1080`. This includes `1920x804`, `1920x1040`, and `1440x1080`.
 - Other sizes (including 720p and 4K), unknown dimensions, and odd dimensions are rejected.
 
-Opening a single unsupported source shows a warning with its resolution and disables
-**Start encoding**. The resolution is also checked before encoding starts. Selecting
-a supported source enables encoding again. No automatic scaling is performed.
+Opening a single unsupported source shows a warning with its resolution and excludes
+it from the queue. **Start encoding** is disabled when no supported source is queued.
+The resolution is also checked before encoding starts. No automatic scaling is performed.
 For multiple files or folders, unsupported and unreadable files are logged and skipped.
 This is a dimension-based check; it cannot establish a file's original resolution before cropping or upscaling.
 
@@ -163,6 +163,10 @@ Output: `<output dir>/<source name><suffix>.mp4`
 
 ### Queue management
 
+- Each drop or **Open...** selection appends files to the existing queue in order.
+  Videos from different folders accumulate, and files already queued are not added again.
+  Existing audio selections and encoding options are preserved. Empty or unsupported
+  new inputs, and cancelling an additional scan, keep the existing queue intact.
 - The **Queue** tab shows each file's name, status and source folder. The **Log** tab
   contains detailed messages.
 - **Remove selected** excludes selected jobs from processing. Use Ctrl / Shift to

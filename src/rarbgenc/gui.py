@@ -581,7 +581,8 @@ class MainWindow(QMainWindow):
         self.ffmpeg = paths
         self._check_selected_encoder()
         if self.ffmpeg is not None and self._pending_paths:
-            self.load_paths(self._pending_paths)
+            pending, self._pending_paths = self._pending_paths, []
+            self.load_paths(pending)
 
     # ---- 원본 파일 ----
 
@@ -594,28 +595,26 @@ class MainWindow(QMainWindow):
     def load_paths(self, paths: list[str]) -> None:
         if not paths or self._encoding or self.loader is not None:
             return
+        if self.ffmpeg is not None and self._pending_paths:
+            paths = [*self._pending_paths, *paths]
+            self._pending_paths = []
         if len(paths) == 1 and not Path(paths[0]).is_dir():
             self.load_file(paths[0])
             return
         if self.ffmpeg is None:
-            self._pending_paths = list(paths)
+            self._pending_paths.extend(paths)
             self._update_queue_controls()
             QMessageBox.warning(self, "ffmpeg required", "Install ffmpeg first (see the notice above).")
             return
         first = Path(paths[0])
         self.settings.last_open_dir = str(first if first.is_dir() else first.parent)
-        self._pending_paths = []
-        self._sources = []
-        self._source_errors = []
         self._cancelled = False
-        self._show_media(None)
-        self.log_view.clear()
         self.queue_label.setText("Scanning video files...")
         self.loader = SourceLoader(self.ffmpeg.ffprobe, list(paths), self)
         self.loader.progress.connect(self.status_label.setText)
         self.loader.finished.connect(self._on_sources_loaded)
         self._set_inputs_enabled(False)
-        self._refresh_queue(reset_status=True)
+        self._update_queue_controls()
         self.queue_tabs.setCurrentIndex(0)
         self._update_start_enabled()
         self.cancel_button.setEnabled(True)
@@ -625,32 +624,29 @@ class MainWindow(QMainWindow):
         loader = self.loader
         assert loader is not None
         cancelled = self._cancelled
-        self._sources = [] if cancelled else loader.sources
-        self._source_errors = loader.errors
         self.loader = None
         loader.deleteLater()
         if self._clear_requested:
             self._reset_queue()
             return
         self.cancel_button.setEnabled(False)
-        self._show_media(self._sources[0] if self._sources else None)
-        self._refresh_queue(reset_status=True)
+        if not cancelled:
+            self._source_errors.extend(loader.errors)
+            for error in loader.errors:
+                self.log_view.appendPlainText(f"[skipped] {error}")
+        added = self._append_sources([] if cancelled else loader.sources)
         self._set_inputs_enabled(True)
-        for error in self._source_errors:
-            self.log_view.appendPlainText(f"[skipped] {error}")
-        self.queue_label.setText(
-            f"{len(self._sources)} video(s) queued, {len(self._source_errors)} skipped"
-        )
         if cancelled:
             self.status_label.setText("Cancelled")
-        elif not self._sources:
-            self.status_label.setText("No supported video files found")
+        elif not loader.sources:
+            self.status_label.setText("No supported video files found in the new inputs")
             QMessageBox.warning(
-                self, "No videos to encode",
-                "No supported 1080p video files were found.\nSee the log for skipped files.",
+                self, "No videos added",
+                "No supported 1080p video files were found in these inputs.\n"
+                "See the log for skipped files.",
             )
         else:
-            self.status_label.setText("Ready to encode the queue")
+            self.status_label.setText(f"Added {added} video(s) to the queue")
         self._update_start_enabled()
 
     def load_file(self, path: str) -> None:
@@ -665,9 +661,16 @@ class MainWindow(QMainWindow):
             return
         self.settings.last_open_dir = str(file.parent)
         if self.ffmpeg is None:
-            self._pending_paths = [path]
+            self._pending_paths.append(path)
             self._update_queue_controls()
             QMessageBox.warning(self, "ffmpeg required", "Install ffmpeg first (see the notice above).")
+            return
+        if self._pending_paths:
+            self.load_paths([path])
+            return
+        if file.resolve() in {media.path.resolve() for media in self._sources}:
+            self.queue_tabs.setCurrentIndex(0)
+            self.status_label.setText("Already in the queue")
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -680,15 +683,42 @@ class MainWindow(QMainWindow):
         if not media.has_video:
             QMessageBox.critical(self, "No video", f"{file.name} has no video stream.")
             return
-        self._pending_paths = []
-        self._sources = [media]
-        self._source_errors = []
-        self._show_media(media)
-        self._refresh_queue(reset_status=True)
-        self.queue_tabs.setCurrentIndex(0)
-        self.queue_label.setText("1 video queued" if media.is_1080p else "No supported video queued")
         if not media.is_1080p:
-            self._show_resolution_warning()
+            error = (
+                f"{file}: Unsupported source resolution: {media.width or '?'}x{media.height or '?'}"
+            )
+            self._source_errors.append(error)
+            self.log_view.appendPlainText(f"[skipped] {error}")
+            if not self._sources:
+                self._show_media(media)
+            self._append_sources([])
+            self._show_resolution_warning(media)
+            return
+        self._append_sources([media])
+        self.status_label.setText("")
+        self.queue_tabs.setCurrentIndex(0)
+
+    def _append_sources(self, sources: list[MediaInfo]) -> int:
+        """기존 항목과 오디오 선택을 유지하며 새 동영상을 중복 없이 추가함"""
+        known = {media.path.resolve() for media in self._sources}
+        added = 0
+        for media in sources:
+            key = media.path.resolve()
+            if key not in known:
+                self._sources.append(media)
+                known.add(key)
+                added += 1
+        if self._sources and (self.media is None or not self.media.is_1080p):
+            self._show_media(self._sources[0])
+        if added:
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(0)
+        self._refresh_queue()
+        self.queue_label.setText(
+            f"{len(self._sources)} video(s) queued, {len(self._source_errors)} skipped"
+        )
+        self._update_start_enabled()
+        return added
 
     def _show_media(self, media: MediaInfo | None) -> None:
         self.media = media
@@ -879,13 +909,14 @@ class MainWindow(QMainWindow):
 
     # ---- 인코딩 ----
 
-    def _show_resolution_warning(self) -> None:
-        assert self.media is not None
-        resolution = f"{self.media.width or '?'}x{self.media.height or '?'}"
+    def _show_resolution_warning(self, media: MediaInfo | None = None) -> None:
+        media = media or self.media
+        assert media is not None
+        resolution = f"{media.width or '?'}x{media.height or '?'}"
         self.status_label.setText(f"Unsupported source resolution: {resolution}")
         QMessageBox.warning(
             self, "1080p source required",
-            f"{self.media.path.name}\nSource resolution: {resolution}\n\n"
+            f"{media.path.name}\nSource resolution: {resolution}\n\n"
             "These encoding profiles support only 1080p sources.\n"
             "1920x1080 and cropped 1080p (e.g. 1920x804 or 1920x1040) are supported.\n"
             "Dimensions must be positive even numbers, no larger than 1920x1080, "
@@ -899,11 +930,9 @@ class MainWindow(QMainWindow):
             self.output_dir_edit, self.output_browse, self.suffix_edit, self.codec_combo,
         ):
             widget.setEnabled(enabled)
-        if enabled:
-            self._update_audio_ui()
-        else:
-            self.track_combo.setEnabled(False)
-            self.language_combo.setEnabled(False)
+        track = self._current_track()
+        self.track_combo.setEnabled(enabled and track is not None)
+        self.language_combo.setEnabled(enabled and track is not None and not track.language)
 
     def start_encoding(self) -> None:
         if self.media is None or self.ffmpeg is None or self._encoding or self.loader is not None:

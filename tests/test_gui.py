@@ -200,6 +200,7 @@ def test_non_1080p_file_blocks_encoding(qapp, no_dialogs, ffmpeg_paths, sample_d
     window = gui.MainWindow(Settings(video_codec=video_codec), str(hd_sample_dir / "multi.mkv"))
     assert window.start_button.isEnabled()
     window.output_dir_edit.setText(str(tmp_path))
+    window.clear_queue_button.click()
     window.load_file(str(sample_dir / "silent.mkv"))
     assert window.media.path == sample_dir / "silent.mkv"
     assert not window.start_button.isEnabled()
@@ -295,6 +296,8 @@ def test_folder_batch_encodes_all_supported_videos(qapp, no_dialogs, ffmpeg_path
     (source / "broken.mp4").write_text("invalid video", encoding="utf-8")
     (source / "notes.srt").write_text("not a video", encoding="utf-8")
     window = gui.MainWindow(Settings())
+    window.drop_area.pathsDropped.emit([str(first)])
+    assert window.queue_view.topLevelItemCount() == 1
     window.drop_area.pathsDropped.emit([str(source), str(first)])
     assert not window.start_button.isEnabled()
     _wait_finished(window)
@@ -473,22 +476,23 @@ def test_batch_uses_each_files_audio_indices_and_languages(batch_window, no_dial
     window.cancel_encoding()
 
 
-def test_empty_folder_clears_previous_queue(batch_window, tmp_path, no_dialogs):
-    window, runners, _ = batch_window
+def test_empty_folder_preserves_previous_queue(batch_window, tmp_path, no_dialogs):
+    window, runners, media = batch_window
     empty = tmp_path / "empty"
     empty.mkdir()
     (empty / "audio.mp3").touch()
     window.load_paths([str(empty)])
     _wait_finished(window)
-    assert window.media is None
-    assert not window.start_button.isEnabled()
-    window.start_encoding()
+    assert [source.path for source in window._sources] == list(media)
+    assert window.media.path == next(iter(media))
+    assert window.queue_view.topLevelItemCount() == 3
+    assert window.start_button.isEnabled()
     assert runners == []
     assert no_dialogs[-1][0] == "warning"
 
 
 @pytest.mark.parametrize("action", ["cancel", "clear"])
-def test_scan_cancellation_discards_queue(batch_window, monkeypatch, no_dialogs, action):
+def test_scan_cancellation_preserves_queue_unless_cleared(batch_window, monkeypatch, no_dialogs, action):
     window, runners, media = batch_window
     entered = Event()
     release = Event()
@@ -515,21 +519,35 @@ def test_scan_cancellation_discards_queue(batch_window, monkeypatch, no_dialogs,
         release.set()
     _wait_finished(window)
     assert len(probed) == 1
-    assert window.media is None
     assert window.status_label.text() == ("Queue cleared" if action == "clear" else "Cancelled")
-    assert window.queue_view.topLevelItemCount() == 0
-    assert not window.start_button.isEnabled()
+    if action == "clear":
+        assert window.media is None
+        assert window.queue_view.topLevelItemCount() == 0
+        assert not window.start_button.isEnabled()
+    else:
+        assert [source.path for source in window._sources] == list(media)
+        assert window.media.path == next(iter(media))
+        assert window.queue_view.topLevelItemCount() == 3
+        assert window.start_button.isEnabled()
     assert runners == []
     assert no_dialogs == []
 
 
-def test_missing_ffmpeg_preserves_all_pending_inputs(batch_window):
+@pytest.mark.parametrize("restore", ["download", "recheck"])
+def test_missing_ffmpeg_accumulates_pending_inputs_across_drops(batch_window, restore):
     window, _, media = batch_window
     ffmpeg = window.ffmpeg
+    window.clear_queue_button.click()
     window.ffmpeg = None
     inputs = list(media)[:2]
-    window.load_paths([str(path) for path in inputs])
-    window._on_download_done(ffmpeg, "")
+    for path in inputs:
+        window.drop_area.pathsDropped.emit([str(path)])
+    if restore == "download":
+        window._on_download_done(ffmpeg, "")
+    else:
+        window.check_ffmpeg()
+        inputs.append(list(media)[2])
+        window.drop_area.pathsDropped.emit([str(inputs[-1])])
     _wait_finished(window)
     assert [source.path for source in window._sources] == inputs
 
@@ -711,3 +729,108 @@ def test_clear_queue_discards_inputs_pending_ffmpeg_install(batch_window):
     assert not window.start_button.isEnabled()
     assert window.queue_view.topLevelItemCount() == 0
     assert runners == []
+
+
+def test_separate_file_drops_append_and_encode_in_order(batch_window, qapp):
+    window, runners, media = batch_window
+    first, _, second = list(media)
+    window.clear_queue_button.click()
+    window.drop_area.pathsDropped.emit([str(first)])
+    window.drop_area.pathsDropped.emit([str(second)])
+    assert first.name == second.name
+    assert first.parent != second.parent
+    assert [source.path for source in window._sources] == [first, second]
+    assert window.queue_tabs.tabText(0) == "Queue (2)"
+    assert window.media.path == first
+    window.start_encoding()
+    assert [runner.job.input_path for runner in runners] == [first]
+    runners[0].finished.emit(True, str(runners[0].job.output_path))
+    qapp.processEvents()
+    assert [runner.job.input_path for runner in runners] == [first, second]
+    runners[1].finished.emit(True, str(runners[1].job.output_path))
+    qapp.processEvents()
+    assert not window._encoding
+    assert "2 succeeded" in window.queue_label.text()
+
+
+def test_repeated_drops_deduplicate_resolved_paths(batch_window):
+    window, _, media = batch_window
+    first = next(iter(media))
+    alias = first.parent / "nested" / ".." / first.name
+    window.drop_area.pathsDropped.emit([str(first)])
+    window.drop_area.pathsDropped.emit([str(alias)])
+    window.drop_area.pathsDropped.emit([str(first.parent), str(alias)])
+    _wait_finished(window)
+    assert [source.path for source in window._sources] == list(media)
+    assert window.queue_view.topLevelItemCount() == 3
+
+
+@pytest.mark.parametrize("input_kind", ["file", "folder", "dialog"])
+def test_appending_preserves_audio_selection_and_options(batch_window, monkeypatch, input_kind):
+    window, _, media = batch_window
+    first, second, third = media.values()
+    first.audio_tracks = [
+        AudioTrack(1, 0, "aac", 2, "stereo", "eng", "", True),
+        AudioTrack(2, 1, "aac", 6, "5.1", None, "", False),
+    ]
+    window.clear_queue_button.click()
+    window.drop_area.pathsDropped.emit([str(first.path)])
+    window.track_combo.setCurrentIndex(1)
+    window.language_combo.setEditText("fre")
+    window.description_combo.setEditText("Keep description")
+    window.suffix_edit.setText("_KEEP")
+    if input_kind == "folder":
+        window.drop_area.pathsDropped.emit([str(first.path.parent)])
+    elif input_kind == "dialog":
+        monkeypatch.setattr(
+            gui.QFileDialog, "getOpenFileNames",
+            lambda *_args: ([str(second.path), str(third.path)], ""),
+        )
+        window.open_button.click()
+    else:
+        window.drop_area.pathsDropped.emit([str(second.path)])
+    _wait_finished(window)
+    expected = [first.path, second.path]
+    if input_kind != "file":
+        expected.append(third.path)
+    assert [source.path for source in window._sources] == expected
+    assert window.media is first
+    assert window.track_combo.currentIndex() == 1
+    assert window.language_combo.currentText() == "fre"
+    assert window.language_combo.isEnabled()
+    assert window.description_combo.currentText() == "Keep description"
+    assert window.suffix_edit.text() == "_KEEP"
+
+
+@pytest.mark.parametrize("invalid_kind", ["resolution", "unreadable", "no-video"])
+def test_invalid_additions_preserve_existing_queue(batch_window, monkeypatch, tmp_path, invalid_kind):
+    window, _, media = batch_window
+    path = tmp_path / "invalid.mkv"
+    path.touch()
+    if invalid_kind == "unreadable":
+        def probe(*_args):
+            raise gui.ProbeError("Cannot read this video")
+        monkeypatch.setattr(gui, "probe", probe)
+    else:
+        media_info = MediaInfo(
+            path, 1, 1280, 720, "h264" if invalid_kind == "resolution" else None
+        )
+        monkeypatch.setattr(gui, "probe", lambda *_args: media_info)
+    window.drop_area.pathsDropped.emit([str(path)])
+    assert [source.path for source in window._sources] == list(media)
+    assert window.media.path == next(iter(media))
+    assert window.queue_view.topLevelItemCount() == 3
+    assert window.start_button.isEnabled()
+
+
+def test_removed_video_can_be_appended_again_and_clear_starts_fresh(batch_window):
+    window, _, media = batch_window
+    first, second, third = list(media)
+    window.queue_view.topLevelItem(1).setSelected(True)
+    window.remove_queue_button.click()
+    window.drop_area.pathsDropped.emit([str(second)])
+    assert [source.path for source in window._sources] == [first, third, second]
+    window.clear_queue_button.click()
+    window.drop_area.pathsDropped.emit([str(third)])
+    assert [source.path for source in window._sources] == [third]
+    assert window.queue_view.topLevelItemCount() == 1
