@@ -230,8 +230,8 @@ def test_header_shows_logo_and_version(qapp, no_dialogs):
     window = gui.MainWindow(Settings())
     assert not window.logo_label.isHidden()
     assert window.logo_label.pixmap().height() == gui.LOGO_HEIGHT
-    assert __version__ == "1.1.0"
-    assert "1.1.0" in window.windowTitle()
+    assert __version__ == "1.2.0"
+    assert "1.2.0" in window.windowTitle()
     assert gui.ICON_PATH.exists()
     assert not window.windowIcon().isNull()
     window.close()
