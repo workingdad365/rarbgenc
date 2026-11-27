@@ -15,6 +15,7 @@ A small desktop app (PySide6) that encodes only 1080p source videos into H.264 o
 
 - Select multiple videos in the file dialog, or drag & drop files and folders
 - Scan all subdirectories for videos, remove duplicates, and encode the queue sequentially
+- Inspect queue entries and their status, remove selected jobs, or clear the entire queue
 - Only 1080p sources are accepted; unsupported resolutions trigger a warning and cannot be encoded
 - Choose H.264 / x264 (8-bit, 2500 kbps, default) or H.265 / x265 (10-bit, 2000 kbps)
 - Pick the audio track to encode (all tracks are listed via `ffprobe`)
@@ -133,9 +134,10 @@ rarbgenc "movie.mkv"     # open the window with a file preloaded
 ```
 
 1. Drop videos or folders on the window (or select multiple files with **Open...**).
-2. Choose the audio track. Set the language only if the source track has none.
-3. Select **Output > Video**, then edit the description, output directory and suffix if needed.
-4. Once scanning finishes, click **Start encoding** once to process the entire queue.
+2. Inspect the **Queue** tab and use **Remove selected** to exclude unwanted jobs.
+3. Choose the audio track. Set the language only if the source track has none.
+4. Select **Output > Video**, then edit the description, output directory and suffix if needed.
+5. Once scanning finishes, click **Start encoding** once to process the entire queue.
 
 Output: `<output dir>/<source name><suffix>.mp4`
 
@@ -158,6 +160,19 @@ Output: `<output dir>/<source name><suffix>.mp4`
 - Both passes finish before the next file starts. Encoding failures are logged and
   the queue continues. One final summary reports successes, failures and skipped files.
   **Cancel** stops the current job and the remaining queue.
+
+### Queue management
+
+- The **Queue** tab shows each file's name, status and source folder. The **Log** tab
+  contains detailed messages.
+- **Remove selected** excludes selected jobs from processing. Use Ctrl / Shift to
+  select multiple entries. While encoding, only waiting jobs can be removed;
+  the current and completed jobs stay in the list. Removed jobs are excluded from
+  subsequent encoding and the total job count.
+- **Clear queue** resets the entire job list and progress. During scanning or encoding,
+  it stops current work before clearing the list; remaining files are not started.
+  You can then load a new set of files or folders.
+- Neither action deletes source files or resets encoding options.
 
 ## Settings file
 

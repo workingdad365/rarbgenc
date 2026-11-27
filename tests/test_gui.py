@@ -142,18 +142,28 @@ def test_invalid_language_is_rejected(qapp, no_dialogs, ffmpeg_paths, hd_sample_
 
 
 @pytest.mark.parametrize("video_codec", ["x264", "x265"])
+@pytest.mark.parametrize("action", ["cancel", "clear"])
 def test_cancel_removes_partial_output(qapp, no_dialogs, ffmpeg_paths, hd_sample_dir, tmp_path,
-                                      video_codec):
+                                      video_codec, action):
     if not gui.ffmpeg_tools.has_encoder(ffmpeg_paths.ffmpeg, f"lib{video_codec}"):
         pytest.skip(f"ffmpeg with lib{video_codec} is not available")
     window = gui.MainWindow(Settings(video_codec=video_codec), str(hd_sample_dir / "multi.mkv"))
+    source = hd_sample_dir / "multi.mkv"
+    original = source.read_bytes()
     window.output_dir_edit.setText(str(tmp_path))
     window.start_encoding()
-    window.cancel_encoding()
+    if action == "clear":
+        window.clear_queue_button.click()
+    else:
+        window.cancel_encoding()
     _wait_finished(window)
     assert window.runner is None
-    assert window.status_label.text() == "Cancelled"
+    assert window.status_label.text() == ("Queue cleared" if action == "clear" else "Cancelled")
     assert list(tmp_path.glob("*.mp4")) == []
+    assert source.read_bytes() == original
+    if action == "clear":
+        assert window.queue_view.topLevelItemCount() == 0
+        assert not window.start_button.isEnabled()
     window.close()
 
 
@@ -477,7 +487,8 @@ def test_empty_folder_clears_previous_queue(batch_window, tmp_path, no_dialogs):
     assert no_dialogs[-1][0] == "warning"
 
 
-def test_scan_cancellation_discards_queue(batch_window, monkeypatch, no_dialogs):
+@pytest.mark.parametrize("action", ["cancel", "clear"])
+def test_scan_cancellation_discards_queue(batch_window, monkeypatch, no_dialogs, action):
     window, runners, media = batch_window
     entered = Event()
     release = Event()
@@ -495,13 +506,18 @@ def test_scan_cancellation_discards_queue(batch_window, monkeypatch, no_dialogs)
         assert entered.wait(5)
         assert window.cancel_button.isEnabled()
         assert not window.start_button.isEnabled()
-        window.cancel_encoding()
+        if action == "clear":
+            assert window.clear_queue_button.isEnabled()
+            window.clear_queue_button.click()
+        else:
+            window.cancel_encoding()
     finally:
         release.set()
     _wait_finished(window)
     assert len(probed) == 1
     assert window.media is None
-    assert window.status_label.text() == "Cancelled"
+    assert window.status_label.text() == ("Queue cleared" if action == "clear" else "Cancelled")
+    assert window.queue_view.topLevelItemCount() == 0
     assert not window.start_button.isEnabled()
     assert runners == []
     assert no_dialogs == []
@@ -516,3 +532,182 @@ def test_missing_ffmpeg_preserves_all_pending_inputs(batch_window):
     window._on_download_done(ffmpeg, "")
     _wait_finished(window)
     assert [source.path for source in window._sources] == inputs
+
+
+def test_queue_lists_paths_and_removes_selected_jobs_without_deleting_files(batch_window, qapp):
+    window, runners, media = batch_window
+    paths = list(media)
+    originals = {}
+    for path in paths:
+        path.write_bytes(f"Source: {path}".encode())
+        originals[path] = path.read_bytes()
+    assert window.queue_tabs.tabText(0) == "Queue (3)"
+    assert window.queue_tabs.tabText(1) == "Log"
+    assert window.queue_view.topLevelItemCount() == 3
+    for index, path in enumerate(paths):
+        item = window.queue_view.topLevelItem(index)
+        assert item.text(0) == path.name
+        assert item.text(1) == "Queued"
+        assert item.text(2) == str(path.parent)
+        assert str(path) in item.toolTip(0)
+    assert not window.remove_queue_button.isEnabled()
+    window.queue_view.topLevelItem(0).setSelected(True)
+    window.queue_view.topLevelItem(2).setSelected(True)
+    assert window.remove_queue_button.isEnabled()
+    window.remove_queue_button.click()
+    assert [source.path for source in window._sources] == [paths[1]]
+    assert window.media.path == paths[1]
+    assert window.queue_view.topLevelItemCount() == 1
+    assert window.queue_tabs.tabText(0) == "Queue (1)"
+    assert window.output_preview.text().endswith("b_ENCODED.mp4")
+    window.start_encoding()
+    assert [runner.job.input_path for runner in runners] == [paths[1]]
+    runners[0].finished.emit(True, str(runners[0].job.output_path))
+    qapp.processEvents()
+    assert not window._encoding
+    assert {path: path.read_bytes() for path in paths} == originals
+
+
+def test_removing_last_queue_items_disables_encoding(batch_window):
+    window, runners, media = batch_window
+    window.queue_view.selectAll()
+    window.remove_queue_button.click()
+    assert window.queue_view.topLevelItemCount() == 0
+    assert window.media is None
+    assert window.info_label.text() == ""
+    assert window.output_preview.text() == ""
+    assert window.drop_area._label.text() == gui.DROP_PROMPT
+    assert not window.start_button.isEnabled()
+    assert not window.remove_queue_button.isEnabled()
+    assert not window.clear_queue_button.isEnabled()
+    window.start_encoding()
+    assert runners == []
+    assert all(path.exists() for path in media)
+
+
+def test_running_queue_removal_preserves_current_job_and_updates_progress(batch_window, qapp):
+    window, runners, media = batch_window
+    paths = list(media)
+    window.start_encoding()
+    assert window.queue_view.topLevelItem(0).text(1) == "Encoding"
+    window.queue_view.topLevelItem(0).setSelected(True)
+    assert not window.remove_queue_button.isEnabled()
+    window.remove_selected_from_queue()
+    assert len(window._sources) == 3
+    runners[0].progress.emit(0.5, "Pass 2/2")
+    window.queue_view.topLevelItem(1).setSelected(True)
+    window.remove_queue_button.click()
+    assert [source.path for source in window._sources] == [paths[0], paths[2]]
+    assert window.runner is runners[0]
+    assert not runners[0].cancelled
+    assert window.progress_bar.value() == 250
+    assert "1/2" in window.status_label.text()
+    runners[0].finished.emit(False, "test failure")
+    qapp.processEvents()
+    assert window.queue_view.topLevelItem(0).text(1) == "Failed"
+    assert window.queue_view.topLevelItem(1).text(1) == "Encoding"
+    assert [runner.job.input_path for runner in runners] == [paths[0], paths[2]]
+    runners[1].finished.emit(True, str(runners[1].job.output_path))
+    qapp.processEvents()
+    assert window.queue_view.topLevelItem(1).text(1) == "Done"
+    assert "1 succeeded, 1 failed" in window.queue_label.text()
+    assert all(path.exists() for path in media)
+
+
+def test_removing_remaining_jobs_between_files_finishes_queue(batch_window, qapp):
+    window, runners, _ = batch_window
+    window.start_encoding()
+    runners[0].finished.emit(True, str(runners[0].job.output_path))
+    window.queue_view.selectAll()
+    window.remove_queue_button.click()
+    qapp.processEvents()
+    assert len(runners) == 1
+    assert not window._encoding
+    assert window.queue_view.topLevelItemCount() == 1
+    assert window.queue_view.topLevelItem(0).text(1) == "Done"
+    assert window.progress_bar.value() == 1000
+
+
+def test_clear_queue_resets_state_and_preserves_files_and_options(batch_window):
+    window, runners, media = batch_window
+    original = {path: path.read_bytes() for path in media}
+    window.description_combo.setEditText("Keep this description")
+    window.suffix_edit.setText("_KEEP")
+    window.clear_queue_button.click()
+    assert window._sources == []
+    assert window._source_errors == []
+    assert window._pending_paths == []
+    assert not window._jobs
+    assert window.media is None
+    assert window.queue_view.topLevelItemCount() == 0
+    assert window.queue_tabs.tabText(0) == "Queue (0)"
+    assert window.progress_bar.value() == 0
+    assert window.status_label.text() == "Queue cleared"
+    assert not window.start_button.isEnabled()
+    assert not window.clear_queue_button.isEnabled()
+    assert window.description_combo.currentText() == "Keep this description"
+    assert window.suffix_edit.text() == "_KEEP"
+    assert {path: path.read_bytes() for path in media} == original
+    window.load_file(str(next(iter(media))))
+    assert window.start_button.isEnabled()
+    assert window.queue_view.topLevelItemCount() == 1
+    assert runners == []
+
+
+def test_clear_running_queue_waits_for_stop_and_never_starts_next_job(
+    batch_window, monkeypatch, qapp, no_dialogs,
+):
+    window, runners, media = batch_window
+    window.start_encoding()
+    active = runners[0]
+    monkeypatch.setattr(active, "cancel", lambda: setattr(active, "cancelled", True))
+    window.clear_queue_button.click()
+    assert active.cancelled
+    assert window.runner is active
+    assert window.status_label.text() == "Clearing queue..."
+    assert not window.clear_queue_button.isEnabled()
+    assert not window.start_button.isEnabled()
+    assert not window.open_button.isEnabled()
+    assert not window._jobs
+    active.finished.emit(False, "Cancelled")
+    qapp.processEvents()
+    assert window.runner is None
+    assert not window._encoding
+    assert window.queue_view.topLevelItemCount() == 0
+    assert window.status_label.text() == "Queue cleared"
+    assert window.open_button.isEnabled()
+    assert len(runners) == 1
+    assert all(path.exists() for path in media)
+    assert no_dialogs == []
+
+
+def test_clear_between_jobs_allows_immediate_new_queue(batch_window, qapp):
+    window, runners, media = batch_window
+    window.start_encoding()
+    runners[0].finished.emit(True, str(runners[0].job.output_path))
+    window.clear_queue_button.click()
+    assert window.queue_view.topLevelItemCount() == 0
+    window.load_file(str(next(iter(media))))
+    window.start_encoding()
+    qapp.processEvents()
+    assert len(runners) == 2
+    assert window.runner is runners[1]
+    assert window.queue_view.topLevelItemCount() == 1
+    window.cancel_encoding()
+
+
+def test_clear_queue_discards_inputs_pending_ffmpeg_install(batch_window):
+    window, runners, media = batch_window
+    ffmpeg = window.ffmpeg
+    window.ffmpeg = None
+    window.load_paths([str(path) for path in media])
+    assert window.clear_queue_button.isEnabled()
+    window.clear_queue_button.click()
+    window._on_download_done(ffmpeg, "")
+    assert window.loader is None
+    assert window._sources == []
+    assert window._pending_paths == []
+    assert window.media is None
+    assert not window.start_button.isEnabled()
+    assert window.queue_view.topLevelItemCount() == 0
+    assert runners == []

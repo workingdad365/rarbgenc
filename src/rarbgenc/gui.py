@@ -12,12 +12,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QProcess, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -27,6 +29,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -301,6 +306,10 @@ class MainWindow(QMainWindow):
         self._jobs: deque[tuple[MediaInfo, encoder.EncodeJob]] = deque()
         self._encoding = False
         self._cancelled = False
+        self._clear_requested = False
+        self._queue_items: dict[Path, QTreeWidgetItem] = {}
+        self._current_fraction = 0.0
+        self._progress_text = ""
         self._total = 0
         self._completed = 0
         self._failed = 0
@@ -454,16 +463,49 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(False)
         root.addWidget(self.progress_bar)
 
-        self.log_view = QPlainTextEdit(self)
+        self.queue_tabs = QTabWidget(self)
+        queue_page = QWidget(self.queue_tabs)
+        queue_layout = QVBoxLayout(queue_page)
+        self.queue_view = QTreeWidget(queue_page)
+        self.queue_view.setHeaderLabels(["File", "Status", "Folder"])
+        self.queue_view.setRootIsDecorated(False)
+        self.queue_view.setUniformRowHeights(True)
+        self.queue_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.queue_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.queue_view.setColumnWidth(0, 240)
+        self.queue_view.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.queue_view.itemSelectionChanged.connect(self._update_queue_controls)
+        queue_layout.addWidget(self.queue_view)
+        queue_buttons = QHBoxLayout()
+        self.remove_queue_button = QPushButton("Remove selected", queue_page)
+        self.remove_queue_button.setToolTip(
+            "Remove selected jobs from the queue without deleting source files. "
+            "While encoding, only waiting jobs can be removed."
+        )
+        self.remove_queue_button.clicked.connect(self.remove_selected_from_queue)
+        self.clear_queue_button = QPushButton("Clear queue", queue_page)
+        self.clear_queue_button.setToolTip(
+            "Stop current work and reset the entire queue. Source files are kept."
+        )
+        self.clear_queue_button.clicked.connect(self.clear_queue)
+        queue_buttons.addWidget(self.remove_queue_button)
+        queue_buttons.addWidget(self.clear_queue_button)
+        queue_buttons.addStretch()
+        queue_layout.addLayout(queue_buttons)
+        self.queue_tabs.addTab(queue_page, "Queue (0)")
+
+        self.log_view = QPlainTextEdit(self.queue_tabs)
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(LOG_TAIL_LINES)
         mono = QFont("Consolas" if sys.platform == "win32" else "Monospace")
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self.log_view.setFont(mono)
-        root.addWidget(self.log_view, 1)
+        self.queue_tabs.addTab(self.log_view, "Log")
+        root.addWidget(self.queue_tabs, 1)
 
         self.setCentralWidget(central)
         self._update_audio_ui()
+        self._update_queue_controls()
 
     def _load_settings(self) -> None:
         s = self.settings
@@ -557,6 +599,7 @@ class MainWindow(QMainWindow):
             return
         if self.ffmpeg is None:
             self._pending_paths = list(paths)
+            self._update_queue_controls()
             QMessageBox.warning(self, "ffmpeg required", "Install ffmpeg first (see the notice above).")
             return
         first = Path(paths[0])
@@ -572,6 +615,8 @@ class MainWindow(QMainWindow):
         self.loader.progress.connect(self.status_label.setText)
         self.loader.finished.connect(self._on_sources_loaded)
         self._set_inputs_enabled(False)
+        self._refresh_queue(reset_status=True)
+        self.queue_tabs.setCurrentIndex(0)
         self._update_start_enabled()
         self.cancel_button.setEnabled(True)
         self.loader.start()
@@ -584,8 +629,12 @@ class MainWindow(QMainWindow):
         self._source_errors = loader.errors
         self.loader = None
         loader.deleteLater()
+        if self._clear_requested:
+            self._reset_queue()
+            return
         self.cancel_button.setEnabled(False)
         self._show_media(self._sources[0] if self._sources else None)
+        self._refresh_queue(reset_status=True)
         self._set_inputs_enabled(True)
         for error in self._source_errors:
             self.log_view.appendPlainText(f"[skipped] {error}")
@@ -617,6 +666,7 @@ class MainWindow(QMainWindow):
         self.settings.last_open_dir = str(file.parent)
         if self.ffmpeg is None:
             self._pending_paths = [path]
+            self._update_queue_controls()
             QMessageBox.warning(self, "ffmpeg required", "Install ffmpeg first (see the notice above).")
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -634,6 +684,8 @@ class MainWindow(QMainWindow):
         self._sources = [media]
         self._source_errors = []
         self._show_media(media)
+        self._refresh_queue(reset_status=True)
+        self.queue_tabs.setCurrentIndex(0)
         self.queue_label.setText("1 video queued" if media.is_1080p else "No supported video queued")
         if not media.is_1080p:
             self._show_resolution_warning()
@@ -657,6 +709,113 @@ class MainWindow(QMainWindow):
         self.track_combo.blockSignals(False)
         self._update_audio_ui()
         self._update_output_preview()
+
+    # ---- 대기열 ----
+
+    def _refresh_queue(self, reset_status: bool = False) -> None:
+        statuses = {} if reset_status else {
+            path: item.text(1) for path, item in self._queue_items.items()
+        }
+        self.queue_view.blockSignals(True)
+        self.queue_view.clear()
+        self._queue_items.clear()
+        for media in self._sources:
+            status = statuses.get(media.path, "Queued" if media.is_1080p else "Unsupported")
+            item = QTreeWidgetItem([media.path.name, status, str(media.path.parent)])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(media.path))
+            item.setToolTip(0, f"{media.path}\n{media.summary()}")
+            item.setToolTip(2, str(media.path.parent))
+            self.queue_view.addTopLevelItem(item)
+            self._queue_items[media.path] = item
+        self.queue_view.blockSignals(False)
+        self._update_queue_controls()
+
+    def _set_queue_status(self, path: Path, status: str) -> None:
+        item = self._queue_items.get(path)
+        if item is not None:
+            item.setText(1, status)
+        self._update_queue_controls()
+
+    def _removable_queue_paths(self) -> set[Path]:
+        if self.loader is not None or self._clear_requested or (self._encoding and self._cancelled):
+            return set()
+        if self._encoding:
+            return {media.path for media, _job in self._jobs}
+        return {media.path for media in self._sources}
+
+    def _selected_queue_paths(self) -> set[Path]:
+        return {
+            Path(item.data(0, Qt.ItemDataRole.UserRole))
+            for item in self.queue_view.selectedItems()
+        }
+
+    def _update_queue_controls(self) -> None:
+        self.queue_tabs.setTabText(0, f"Queue ({len(self._sources)})")
+        self.remove_queue_button.setEnabled(
+            bool(self._selected_queue_paths() & self._removable_queue_paths())
+        )
+        self.clear_queue_button.setEnabled(
+            not self._clear_requested
+            and bool(self._sources or self._pending_paths or self.loader is not None)
+        )
+
+    def remove_selected_from_queue(self) -> None:
+        removed = self._selected_queue_paths() & self._removable_queue_paths()
+        if not removed:
+            return
+        self._sources = [media for media in self._sources if media.path not in removed]
+        if self._encoding:
+            self._jobs = deque(
+                (media, job) for media, job in self._jobs if media.path not in removed
+            )
+            self._total -= len(removed)
+            if self.runner is not None:
+                self.queue_label.setText(
+                    f"Encoding {self._completed + 1}/{self._total}: {self.media.path.name}"
+                )
+                self._on_progress(self._current_fraction, self._progress_text)
+            else:
+                self.queue_label.setText(f"{self._completed} completed, {len(self._jobs)} waiting")
+                self.progress_bar.setValue(int(self._completed / self._total * 1000))
+        else:
+            if self.media is not None and self.media.path in removed:
+                self._show_media(self._sources[0] if self._sources else None)
+            self.queue_label.setText(
+                f"{len(self._sources)} video(s) in queue, {len(self._source_errors)} skipped"
+            )
+            self.status_label.setText(f"Removed {len(removed)} job(s) from the queue")
+        self._refresh_queue()
+        self._update_start_enabled()
+
+    def clear_queue(self) -> None:
+        if self._clear_requested:
+            return
+        if self.loader is not None or self._encoding:
+            self._clear_requested = True
+            self._update_queue_controls()
+            self.cancel_encoding()
+            if self._clear_requested:
+                self.status_label.setText("Clearing queue...")
+        else:
+            self._reset_queue()
+
+    def _reset_queue(self) -> None:
+        self._sources.clear()
+        self._source_errors.clear()
+        self._pending_paths.clear()
+        self._jobs.clear()
+        self._encoding = self._cancelled = self._clear_requested = False
+        self._total = self._completed = self._failed = 0
+        self._track_order = -1
+        self._current_fraction = 0.0
+        self._progress_text = ""
+        self._last_result = (False, "")
+        self._show_media(None)
+        self._refresh_queue()
+        self._set_inputs_enabled(True)
+        self.cancel_button.setEnabled(False)
+        self.queue_label.setText("0 videos queued")
+        self.status_label.setText("Queue cleared")
 
     # ---- 오디오 ----
 
@@ -796,6 +955,7 @@ class MainWindow(QMainWindow):
         self._cancelled = False
         self._encoding = True
         self._batch_started_at = time.monotonic()
+        self._refresh_queue(reset_status=True)
         self._set_inputs_enabled(False)
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
@@ -851,7 +1011,10 @@ class MainWindow(QMainWindow):
             return
         assert self.ffmpeg is not None
         media, job = self._jobs.popleft()
+        self._current_fraction = 0.0
+        self._progress_text = ""
         self._show_media(media)
+        self._set_queue_status(media.path, "Encoding")
         for index, track in enumerate(media.audio_tracks):
             if track.stream_index == job.audio_stream_index:
                 self.track_combo.setCurrentIndex(index)
@@ -882,6 +1045,7 @@ class MainWindow(QMainWindow):
         elif self._encoding:
             self._cancelled = True
             self._jobs.clear()
+            self._update_queue_controls()
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Cancelling...")
             if self.runner is not None:
@@ -890,6 +1054,10 @@ class MainWindow(QMainWindow):
                 self._finish_queue()
 
     def _on_progress(self, fraction: float, text: str) -> None:
+        if not self._encoding:
+            return
+        self._current_fraction = fraction
+        self._progress_text = text
         self.progress_bar.setValue(int((self._completed + fraction) / self._total * 1000))
         elapsed = time.monotonic() - self._started_at
         info = f"{text}   elapsed {_format_seconds(elapsed)}"
@@ -903,6 +1071,10 @@ class MainWindow(QMainWindow):
         if self.runner is not None:
             self.runner.deleteLater()
         self.runner = None
+        self._current_fraction = 0.0
+        self._set_queue_status(
+            self.media.path, "Cancelled" if self._cancelled else ("Done" if ok else "Failed")
+        )
         self._last_result = (ok, message)
         self.log_view.appendPlainText(f"[{'saved' if ok else 'failed'}] {message}")
         if self._cancelled:
@@ -917,12 +1089,16 @@ class MainWindow(QMainWindow):
     def _finish_queue(self) -> None:
         self._encoding = False
         self._jobs.clear()
+        if self._clear_requested:
+            self._reset_queue()
+            return
         self._show_media(self._sources[0])
         if self._track_order >= 0:
             self.track_combo.setCurrentIndex(self._track_order)
         self.cancel_button.setEnabled(False)
         self._set_inputs_enabled(True)
         self._update_start_enabled()
+        self._update_queue_controls()
         elapsed = _format_seconds(time.monotonic() - self._batch_started_at)
         summary = (
             f"{self._completed - self._failed} succeeded, {self._failed} failed, "
