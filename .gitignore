@@ -1,5 +1,13 @@
 __pycache__/
 *.py[cod]
+.*/
+!.github/
+!.gitlab/
+!.devcontainer/
+!.githooks/
+!.husky/
+!.mvn/
+!.well-known/
 .venv/
 .pytest_cache/
 build/

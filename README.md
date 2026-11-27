@@ -13,7 +13,8 @@ A small desktop app (PySide6) that encodes only 1080p source videos into H.264 o
 
 ## Features
 
-- Open a source video with a file dialog or drag & drop
+- Select multiple videos in the file dialog, or drag & drop files and folders
+- Scan all subdirectories for videos, remove duplicates, and encode the queue sequentially
 - Only 1080p sources are accepted; unsupported resolutions trigger a warning and cannot be encoded
 - Choose H.264 / x264 (8-bit, 2500 kbps, default) or H.265 / x265 (10-bit, 2000 kbps)
 - Pick the audio track to encode (all tracks are listed via `ffprobe`)
@@ -56,9 +57,10 @@ non-cover-art video stream reported by `ffprobe`:
   width `1920` or height `1080`. This includes `1920x804`, `1920x1040`, and `1440x1080`.
 - Other sizes (including 720p and 4K), unknown dimensions, and odd dimensions are rejected.
 
-Opening an unsupported source shows a warning with its resolution and disables
+Opening a single unsupported source shows a warning with its resolution and disables
 **Start encoding**. The resolution is also checked before encoding starts. Selecting
 a supported source enables encoding again. No automatic scaling is performed.
+For multiple files or folders, unsupported and unreadable files are logged and skipped.
 This is a dimension-based check; it cannot establish a file's original resolution before cropping or upscaling.
 
 ### Sample verification
@@ -130,12 +132,32 @@ rarbgenc                 # open the window
 rarbgenc "movie.mkv"     # open the window with a file preloaded
 ```
 
-1. Drop a supported 1080p video on the window (or click **Open...**).
+1. Drop videos or folders on the window (or select multiple files with **Open...**).
 2. Choose the audio track. Set the language only if the source track has none.
 3. Select **Output > Video**, then edit the description, output directory and suffix if needed.
-4. Click **Start encoding**.
+4. Once scanning finishes, click **Start encoding** once to process the entire queue.
 
 Output: `<output dir>/<source name><suffix>.mp4`
+
+### Batch processing
+
+- Folder scanning and video inspection run in the background and can be cancelled.
+- Inputs keep their supplied order. Within each folder, files are sorted by name,
+  followed by subfolders in name order. Video extensions identify candidates;
+  `ffprobe` verifies the video stream and supported 1080p dimensions.
+  Overlapping folders and repeated files are deduplicated. Directory symlinks and
+  junctions are not followed during recursive traversal.
+- The audio track number selected for the first video applies to all files. If that
+  number is absent, the file's default audio track (or first track) is used.
+  Each track keeps its own language tag, with the saved fallback language used only
+  when no tag exists. Silent videos remain silent.
+- Codec, description, output directory and suffix apply to the entire queue.
+  A blank output directory saves each result alongside its source. Conflicting output
+  names receive `_2`, `_3`, etc. No output may overwrite a queued source.
+  Existing output files are confirmed together before encoding starts.
+- Both passes finish before the next file starts. Encoding failures are logged and
+  the queue continues. One final summary reports successes, failures and skipped files.
+  **Cancel** stops the current job and the remaining queue.
 
 ## Settings file
 
@@ -162,6 +184,7 @@ GUI tests run with `QT_QPA_PLATFORM=offscreen`.
 src/rarbgenc/
   encoder.py       2-pass command builder, audio profile, progress parsing
   probe.py         ffprobe wrapper
+  sources.py       recursive video discovery, extension filtering and deduplication
   languages.py     ISO 639-2 codes and normalization
   settings.py      persisted user settings
   ffmpeg_tools.py  ffmpeg lookup, auto download, install hints

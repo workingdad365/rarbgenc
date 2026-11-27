@@ -6,9 +6,10 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QProcess, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,11 +34,10 @@ from PySide6.QtWidgets import (
 from rarbgenc import __version__, encoder, ffmpeg_tools, languages
 from rarbgenc.probe import MediaInfo, ProbeError, probe
 from rarbgenc.settings import Settings
+from rarbgenc.sources import VIDEO_EXTENSIONS, iter_video_files
 
-VIDEO_FILTER = (
-    "Video files (*.mkv *.mp4 *.m4v *.m2ts *.mts *.ts *.avi *.mov *.wmv *.webm "
-    "*.mpg *.mpeg *.vob *.flv);;All files (*)"
-)
+VIDEO_FILTER = "Video files (" + " ".join(f"*{ext}" for ext in VIDEO_EXTENSIONS) + ");;All files (*)"
+DROP_PROMPT = "Drop video files or folders here"
 LOG_TAIL_LINES = 200
 LOGO_PATH = Path(__file__).parent / "assets" / "rarbg_logo.png"
 LOGO_HEIGHT = 36
@@ -70,16 +70,17 @@ def _set_windows_app_id(app_id: str) -> None:
 
 
 class DropArea(QFrame):
-    """파일 드래그앤드랍 영역"""
+    """파일과 폴더 드래그앤드랍 영역"""
 
-    fileDropped = Signal(str)
+    pathsDropped = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setMinimumHeight(90)
-        self._label = QLabel("Drop a video file here", self)
+        self._label = QLabel(DROP_PROMPT, self)
+        self._label.setTextFormat(Qt.TextFormat.PlainText)
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._label.setWordWrap(True)
         _elastic(self._label)
@@ -95,18 +96,22 @@ class DropArea(QFrame):
         self.setStyleSheet(f"DropArea {{ border: 2px dashed {border}; border-radius: 8px; }}")
 
     @staticmethod
-    def _local_file(event) -> str | None:
+    def _local_paths(event) -> list[str]:
         mime = event.mimeData()
         if not mime.hasUrls():
-            return None
+            return []
+        paths = []
         for url in mime.urls():
             path = url.toLocalFile()
-            if path and Path(path).is_file():
-                return path
-        return None
+            if not path:
+                continue
+            file = Path(path)
+            if file.is_dir() or (file.is_file() and file.suffix.lower() in VIDEO_EXTENSIONS):
+                paths.append(path)
+        return paths
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self.isEnabled() and self._local_file(event):
+        if self.isEnabled() and self._local_paths(event):
             event.acceptProposedAction()
             self._set_highlight(True)
         else:
@@ -117,10 +122,44 @@ class DropArea(QFrame):
 
     def dropEvent(self, event: QDropEvent) -> None:
         self._set_highlight(False)
-        path = self._local_file(event)
-        if path:
+        paths = self._local_paths(event) if self.isEnabled() else []
+        if paths:
             event.acceptProposedAction()
-            self.fileDropped.emit(path)
+            self.pathsDropped.emit(paths)
+        else:
+            event.ignore()
+
+
+class SourceLoader(QThread):
+    """폴더 탐색과 동영상 검사를 백그라운드에서 수행함"""
+
+    progress = Signal(str)
+
+    def __init__(self, ffprobe: str, paths: list[str], parent: QObject) -> None:
+        super().__init__(parent)
+        self._ffprobe = ffprobe
+        self._paths = paths
+        self.sources: list[MediaInfo] = []
+        self.errors: list[str] = []
+
+    def run(self) -> None:
+        for path in iter_video_files(
+            self._paths, lambda exc: self.errors.append(str(exc)), self.isInterruptionRequested
+        ):
+            self.progress.emit(f"Scanning: {path}")
+            try:
+                media = probe(self._ffprobe, path)
+            except ProbeError as exc:
+                self.errors.append(f"{path}: {exc}")
+                continue
+            if not media.has_video:
+                self.errors.append(f"{path}: No video stream")
+            elif not media.is_1080p:
+                self.errors.append(
+                    f"{path}: Unsupported source resolution: {media.width or '?'}x{media.height or '?'}"
+                )
+            else:
+                self.sources.append(media)
 
 
 class EncodeRunner(QObject):
@@ -255,7 +294,20 @@ class MainWindow(QMainWindow):
         self.media: MediaInfo | None = None
         self.runner: EncodeRunner | None = None
         self.downloader: DownloadWorker | None = None
+        self.loader: SourceLoader | None = None
+        self._sources: list[MediaInfo] = []
+        self._source_errors: list[str] = []
+        self._pending_paths: list[str] = []
+        self._jobs: deque[tuple[MediaInfo, encoder.EncodeJob]] = deque()
+        self._encoding = False
+        self._cancelled = False
+        self._total = 0
+        self._completed = 0
+        self._failed = 0
+        self._track_order = -1
         self._started_at = 0.0
+        self._batch_started_at = 0.0
+        self._last_result = (False, "")
 
         self.setWindowTitle(f"rarbgenc {__version__} - RARBG-style x264/x265 encoder")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -317,7 +369,7 @@ class MainWindow(QMainWindow):
         source_box = QGroupBox("Source", self)
         source_layout = QVBoxLayout(source_box)
         self.drop_area = DropArea(source_box)
-        self.drop_area.fileDropped.connect(self.load_file)
+        self.drop_area.pathsDropped.connect(self.load_paths)
         open_row = QHBoxLayout()
         self.open_button = QPushButton("Open...", source_box)
         self.open_button.clicked.connect(self.open_file_dialog)
@@ -327,12 +379,18 @@ class MainWindow(QMainWindow):
         open_row.addWidget(self.info_label, 1)
         source_layout.addWidget(self.drop_area)
         source_layout.addLayout(open_row)
+        self.queue_label = _elastic(QLabel("", source_box))
+        source_layout.addWidget(self.queue_label)
         root.addWidget(source_box)
 
         # 오디오
         audio_box = QGroupBox("Audio", self)
         audio_form = QFormLayout(audio_box)
         self.track_combo = QComboBox(audio_box)
+        self.track_combo.setToolTip(
+            "For a batch, use this audio track number in every file. "
+            "If absent, use that file's default or first audio track."
+        )
         self.track_combo.currentIndexChanged.connect(self._on_track_changed)
         self.language_combo = QComboBox(audio_box)
         self.language_combo.setEditable(True)
@@ -361,10 +419,10 @@ class MainWindow(QMainWindow):
         self.output_dir_edit = QLineEdit(output_box)
         self.output_dir_edit.setPlaceholderText("Same folder as source")
         self.output_dir_edit.textChanged.connect(self._update_output_preview)
-        browse = QPushButton("Browse...", output_box)
-        browse.clicked.connect(self.choose_output_dir)
+        self.output_browse = QPushButton("Browse...", output_box)
+        self.output_browse.clicked.connect(self.choose_output_dir)
         dir_row.addWidget(self.output_dir_edit, 1)
-        dir_row.addWidget(browse)
+        dir_row.addWidget(self.output_browse)
         self.suffix_edit = QLineEdit(output_box)
         self.suffix_edit.textChanged.connect(self._update_output_preview)
         self.output_preview = QLabel("", output_box)
@@ -480,55 +538,125 @@ class MainWindow(QMainWindow):
             return
         self.ffmpeg = paths
         self._check_selected_encoder()
-        if self.media is None and self.drop_area.property("pending"):
-            self.load_file(self.drop_area.property("pending"))
+        if self.ffmpeg is not None and self._pending_paths:
+            self.load_paths(self._pending_paths)
 
     # ---- 원본 파일 ----
 
     def open_file_dialog(self) -> None:
         start = self.settings.last_open_dir or str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(self, "Open video", start, VIDEO_FILTER)
-        if path:
-            self.load_file(path)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open videos", start, VIDEO_FILTER)
+        if paths:
+            self.load_paths(paths)
+
+    def load_paths(self, paths: list[str]) -> None:
+        if not paths or self._encoding or self.loader is not None:
+            return
+        if len(paths) == 1 and not Path(paths[0]).is_dir():
+            self.load_file(paths[0])
+            return
+        if self.ffmpeg is None:
+            self._pending_paths = list(paths)
+            QMessageBox.warning(self, "ffmpeg required", "Install ffmpeg first (see the notice above).")
+            return
+        first = Path(paths[0])
+        self.settings.last_open_dir = str(first if first.is_dir() else first.parent)
+        self._pending_paths = []
+        self._sources = []
+        self._source_errors = []
+        self._cancelled = False
+        self._show_media(None)
+        self.log_view.clear()
+        self.queue_label.setText("Scanning video files...")
+        self.loader = SourceLoader(self.ffmpeg.ffprobe, list(paths), self)
+        self.loader.progress.connect(self.status_label.setText)
+        self.loader.finished.connect(self._on_sources_loaded)
+        self._set_inputs_enabled(False)
+        self._update_start_enabled()
+        self.cancel_button.setEnabled(True)
+        self.loader.start()
+
+    def _on_sources_loaded(self) -> None:
+        loader = self.loader
+        assert loader is not None
+        cancelled = self._cancelled
+        self._sources = [] if cancelled else loader.sources
+        self._source_errors = loader.errors
+        self.loader = None
+        loader.deleteLater()
+        self.cancel_button.setEnabled(False)
+        self._show_media(self._sources[0] if self._sources else None)
+        self._set_inputs_enabled(True)
+        for error in self._source_errors:
+            self.log_view.appendPlainText(f"[skipped] {error}")
+        self.queue_label.setText(
+            f"{len(self._sources)} video(s) queued, {len(self._source_errors)} skipped"
+        )
+        if cancelled:
+            self.status_label.setText("Cancelled")
+        elif not self._sources:
+            self.status_label.setText("No supported video files found")
+            QMessageBox.warning(
+                self, "No videos to encode",
+                "No supported 1080p video files were found.\nSee the log for skipped files.",
+            )
+        else:
+            self.status_label.setText("Ready to encode the queue")
+        self._update_start_enabled()
 
     def load_file(self, path: str) -> None:
-        if self.runner is not None:
+        if self._encoding or self.loader is not None:
             return
         file = Path(path)
+        if file.is_dir():
+            self.load_paths([path])
+            return
+        if file.suffix.lower() not in VIDEO_EXTENSIONS:
+            QMessageBox.warning(self, "Not a video file", "Choose a video file or a folder.")
+            return
         self.settings.last_open_dir = str(file.parent)
         if self.ffmpeg is None:
-            self.drop_area.setProperty("pending", path)
+            self._pending_paths = [path]
             QMessageBox.warning(self, "ffmpeg required", "Install ffmpeg first (see the notice above).")
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             media = probe(self.ffmpeg.ffprobe, file)
         except ProbeError as exc:
-            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Cannot read file", f"{file.name}\n\n{exc}")
             return
-        QApplication.restoreOverrideCursor()
+        finally:
+            QApplication.restoreOverrideCursor()
         if not media.has_video:
             QMessageBox.critical(self, "No video", f"{file.name} has no video stream.")
             return
+        self._pending_paths = []
+        self._sources = [media]
+        self._source_errors = []
+        self._show_media(media)
+        self.queue_label.setText("1 video queued" if media.is_1080p else "No supported video queued")
+        if not media.is_1080p:
+            self._show_resolution_warning()
+
+    def _show_media(self, media: MediaInfo | None) -> None:
         self.media = media
-        self.drop_area.setText(f"{file.name}\n{file.parent}")
-        self.info_label.setText(media.summary())
+        self.drop_area.setText(f"{media.path.name}\n{media.path.parent}" if media else DROP_PROMPT)
+        self.info_label.setText(media.summary() if media else "")
+        self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.status_label.setText("")
 
         self.track_combo.blockSignals(True)
         self.track_combo.clear()
-        for track in media.audio_tracks:
+        tracks = media.audio_tracks if media else []
+        for track in tracks:
             self.track_combo.addItem(track.label(), track.order)
-        default = next((t.order for t in media.audio_tracks if t.is_default), 0)
-        if media.audio_tracks:
+        default = next((t.order for t in tracks if t.is_default), 0)
+        if tracks:
             self.track_combo.setCurrentIndex(default)
         self.track_combo.blockSignals(False)
         self._update_audio_ui()
         self._update_output_preview()
-        if not media.is_1080p:
-            self._show_resolution_warning()
 
     # ---- 오디오 ----
 
@@ -585,7 +713,8 @@ class MainWindow(QMainWindow):
 
     def _update_start_enabled(self) -> None:
         self.start_button.setEnabled(
-            self.runner is None and self.ffmpeg is not None and self.media is not None
+            not self._encoding and self.loader is None
+            and self.ffmpeg is not None and self.media is not None
             and self.media.is_1080p
         )
 
@@ -608,7 +737,7 @@ class MainWindow(QMainWindow):
     def _set_inputs_enabled(self, enabled: bool) -> None:
         for widget in (
             self.drop_area, self.open_button, self.description_combo,
-            self.output_dir_edit, self.suffix_edit, self.codec_combo,
+            self.output_dir_edit, self.output_browse, self.suffix_edit, self.codec_combo,
         ):
             widget.setEnabled(enabled)
         if enabled:
@@ -618,108 +747,230 @@ class MainWindow(QMainWindow):
             self.language_combo.setEnabled(False)
 
     def start_encoding(self) -> None:
-        if self.media is None or self.ffmpeg is None or self.runner is not None:
+        if self.media is None or self.ffmpeg is None or self._encoding or self.loader is not None:
             return
         if not self.media.is_1080p:
             self._show_resolution_warning()
             return
-        out = self._output_path()
-        assert out is not None
+        track = self._current_track()
+        fallback = self.settings.fallback_language
+        if track is not None and not track.language:
+            fallback = languages.parse_display(self.language_combo.currentText())
+        if not languages.is_valid_code(fallback):
+            QMessageBox.critical(self, "Invalid language", "Enter a three-letter ISO 639-2 code (e.g. eng, kor, jpn).")
+            return
+        self._track_order = self.track_combo.currentIndex()
+        description = self.description_combo.currentText().strip()
         try:
-            same = out.resolve() == self.media.path.resolve()
-        except OSError:
-            same = False
-        if same:
-            QMessageBox.critical(self, "Invalid output", "Output file would overwrite the source file.\nSet a suffix or another directory.")
+            jobs = self._prepare_jobs(fallback, description)
+        except OSError as exc:
+            QMessageBox.critical(self, "Invalid output", str(exc))
+            return
+        if not jobs:
             return
 
-        track = self._current_track()
-        language = languages.DEFAULT_LANGUAGE
-        if track is not None:
-            if track.language:
-                language = track.language
-            else:
-                language = languages.parse_display(self.language_combo.currentText())
-                if not languages.is_valid_code(language):
-                    QMessageBox.critical(self, "Invalid language", "Enter a three-letter ISO 639-2 code (e.g. eng, kor, jpn).")
-                    return
-                self.settings.fallback_language = language
-
-        if out.exists():
-            answer = QMessageBox.question(self, "Overwrite?", f"{out}\nalready exists. Overwrite it?")
+        existing = [job.output_path for _, job in jobs if job.output_path.exists()]
+        if existing:
+            listing = "\n".join(str(path) for path in existing[:10])
+            if len(existing) > 10:
+                listing += f"\n... and {len(existing) - 10} more"
+            answer = QMessageBox.question(
+                self, "Overwrite?",
+                f"{len(existing)} output file(s) already exist:\n{listing}\n\nOverwrite them?",
+            )
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
-        description = self.description_combo.currentText().strip()
+        self.settings.fallback_language = fallback
         self._store_settings()
         self.description_combo.clear()
         self.description_combo.addItems(self.settings.description_history)
         self.description_combo.setEditText(description)
 
-        job = encoder.EncodeJob(
-            input_path=self.media.path,
-            output_path=out,
-            audio_stream_index=track.stream_index if track else None,
-            audio_channels=track.channels if track else 0,
-            language=language,
-            description=description,
-            video_codec=self.codec_combo.currentData(),
-        )
         self.log_view.clear()
-        self.runner = EncodeRunner(self.ffmpeg.ffmpeg, job, self.media.duration)
-        self.runner.progress.connect(self._on_progress)
-        self.runner.log.connect(self.log_view.appendPlainText)
-        self.runner.finished.connect(self._on_finished)
+        for error in self._source_errors:
+            self.log_view.appendPlainText(f"[skipped] {error}")
+        self._jobs = deque(jobs)
+        self._total = len(jobs)
+        self._completed = self._failed = 0
+        self._cancelled = False
+        self._encoding = True
+        self._batch_started_at = time.monotonic()
         self._set_inputs_enabled(False)
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
-        if not self.media.duration:
+        self._start_next_job()
+
+    def _prepare_jobs(self, fallback: str, description: str) -> list[tuple[MediaInfo, encoder.EncodeJob]]:
+        sources = self._sources
+        source_paths = {media.path.resolve() for media in sources}
+        outputs: set[Path] = set()
+        jobs = []
+        for media in sources:
+            if not media.is_1080p:
+                QMessageBox.warning(self, "1080p source required", f"{media.path}\nUnsupported source resolution.")
+                return []
+            out = encoder.output_path_for(
+                media.path, self.output_dir_edit.text(), self.suffix_edit.text()
+            )
+            if out.resolve() in source_paths:
+                QMessageBox.critical(
+                    self, "Invalid output",
+                    f"Output file would overwrite a source file:\n{out}\nSet a suffix or another directory.",
+                )
+                return []
+            if out.resolve() in outputs:
+                base = out
+                number = 2
+                while out.resolve() in outputs or out.resolve() in source_paths or out.exists():
+                    out = base.with_name(f"{base.stem}_{number}{base.suffix}")
+                    number += 1
+            outputs.add(out.resolve())
+            tracks = media.audio_tracks
+            track = (
+                tracks[self._track_order] if 0 <= self._track_order < len(tracks)
+                else next((t for t in tracks if t.is_default), tracks[0] if tracks else None)
+            )
+            job = encoder.EncodeJob(
+                input_path=media.path,
+                output_path=out,
+                audio_stream_index=track.stream_index if track else None,
+                audio_channels=track.channels if track else 0,
+                language=track.language if track and track.language else fallback,
+                description=description,
+                video_codec=self.codec_combo.currentData(),
+            )
+            jobs.append((media, job))
+        return jobs
+
+    def _start_next_job(self) -> None:
+        if not self._encoding or self.runner is not None:
+            return
+        if self._cancelled or not self._jobs:
+            self._finish_queue()
+            return
+        assert self.ffmpeg is not None
+        media, job = self._jobs.popleft()
+        self._show_media(media)
+        for index, track in enumerate(media.audio_tracks):
+            if track.stream_index == job.audio_stream_index:
+                self.track_combo.setCurrentIndex(index)
+                break
+        self.output_preview.setText(str(job.output_path))
+        self._set_inputs_enabled(False)
+        self.queue_label.setText(f"Encoding {self._completed + 1}/{self._total}: {media.path.name}")
+        self.log_view.appendPlainText(f"[{self._completed + 1}/{self._total}] {media.path}")
+        if not media.duration:
             self.progress_bar.setRange(0, 0)  # 길이를 알 수 없으면 불확정 표시
         self._started_at = time.monotonic()
+        try:
+            self.runner = EncodeRunner(self.ffmpeg.ffmpeg, job, media.duration)
+        except OSError as exc:
+            self._on_finished(False, str(exc))
+            return
+        self.runner.progress.connect(self._on_progress)
+        self.runner.log.connect(self.log_view.appendPlainText)
+        self.runner.finished.connect(self._on_finished)
         self.runner.start()
 
     def cancel_encoding(self) -> None:
-        if self.runner is not None:
+        if self.loader is not None:
+            self._cancelled = True
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Cancelling scan...")
+            self.loader.requestInterruption()
+        elif self._encoding:
+            self._cancelled = True
+            self._jobs.clear()
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Cancelling...")
-            self.runner.cancel()
+            if self.runner is not None:
+                self.runner.cancel()
+            else:
+                self._finish_queue()
 
     def _on_progress(self, fraction: float, text: str) -> None:
-        self.progress_bar.setValue(int(fraction * 1000))
+        self.progress_bar.setValue(int((self._completed + fraction) / self._total * 1000))
         elapsed = time.monotonic() - self._started_at
         info = f"{text}   elapsed {_format_seconds(elapsed)}"
         if 0.01 < fraction < 1.0:
             info += f"   ETA {_format_seconds(elapsed * (1 - fraction) / fraction)}"
+        if self._total > 1:
+            info = f"File {self._completed + 1}/{self._total}   {info}"
         self.status_label.setText(info)
 
     def _on_finished(self, ok: bool, message: str) -> None:
+        if self.runner is not None:
+            self.runner.deleteLater()
         self.runner = None
-        self.progress_bar.setRange(0, 1000)
+        self._last_result = (ok, message)
+        self.log_view.appendPlainText(f"[{'saved' if ok else 'failed'}] {message}")
+        if self._cancelled:
+            self._finish_queue()
+            return
+        self._completed += 1
+        if not ok:
+            self._failed += 1
+        self.progress_bar.setValue(int(self._completed / self._total * 1000))
+        QTimer.singleShot(0, self._start_next_job)
+
+    def _finish_queue(self) -> None:
+        self._encoding = False
+        self._jobs.clear()
+        self._show_media(self._sources[0])
+        if self._track_order >= 0:
+            self.track_combo.setCurrentIndex(self._track_order)
         self.cancel_button.setEnabled(False)
         self._set_inputs_enabled(True)
         self._update_start_enabled()
-        elapsed = _format_seconds(time.monotonic() - self._started_at)
-        if ok:
+        elapsed = _format_seconds(time.monotonic() - self._batch_started_at)
+        summary = (
+            f"{self._completed - self._failed} succeeded, {self._failed} failed, "
+            f"{len(self._source_errors)} skipped"
+        )
+        self.queue_label.setText(summary)
+        if self._cancelled:
+            self.status_label.setText("Cancelled")
+            return
+        ok, message = self._last_result
+        if self._total > 1 or self._source_errors:
+            self.progress_bar.setValue(1000)
+            self.status_label.setText(f"Queue finished in {elapsed}")
+            QMessageBox.information(
+                self, "Encoding finished", f"{summary}\n\nSee the log for file details."
+            )
+        elif ok:
             self.progress_bar.setValue(1000)
             self.status_label.setText(f"Done in {elapsed}")
             QMessageBox.information(self, "Encoding finished", f"Saved to:\n{message}")
         else:
-            self.progress_bar.setValue(0)
             self.status_label.setText(message)
-            if message != "Cancelled":
-                QMessageBox.critical(self, "Encoding failed", f"{message}\n\nSee the log for details.")
+            QMessageBox.critical(self, "Encoding failed", f"{message}\n\nSee the log for details.")
 
     def closeEvent(self, event) -> None:
         if self.downloader is not None:
             QMessageBox.information(self, "Download in progress", "Wait until the ffmpeg download finishes.")
             event.ignore()
             return
-        if self.runner is not None:
+        if self.loader is not None:
+            answer = QMessageBox.question(self, "Scan in progress", "Cancel scanning and quit?")
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._cancelled = True
+            self.loader.requestInterruption()
+            self.loader.wait()
+        if self._encoding:
             answer = QMessageBox.question(self, "Encoding in progress", "Cancel encoding and quit?")
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.runner.cancel_and_wait()
+            self._cancelled = True
+            self._jobs.clear()
+            if self.runner is not None:
+                self.runner.cancel_and_wait()
+            else:
+                self._finish_queue()
         self._store_settings()
         event.accept()
 
